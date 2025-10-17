@@ -10,4 +10,4 @@ done
 average=$((sum/count))
 
 echo "Число аргументов: $count"
-echo "Число аргументов: $average"
+echo "Среднее значение: $average"
