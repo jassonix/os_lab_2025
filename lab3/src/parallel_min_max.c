@@ -1,198 +1,165 @@
+#define _POSIX_C_SOURCE 199309L
 #include <stdio.h>
 #include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <string.h>
-#include <limits.h>
-
-#include "find_min_max.h"
+#include <unistd.h>
+#include <sys/wait.h>
+#include <time.h>
 #include "utils.h"
+#include "find_min_max.h"
 
-// Константы для синхронизации через файлы
-#define FILE_SYNC_BASE "minmax_result_"
-#define FILE_SYNC_EXT ".txt"
+#define MAX_PROCESSES 100
 
-// Структура для передачи данных в потоках
-struct ThreadData {
-    int *array;
-    unsigned int begin;
-    unsigned int end;
-    int index; // Индекс процесса/потока (0 или 1)
-    struct MinMax result;
-};
-
-// Функция для записи результата в файл
-void write_result_to_file(int index, struct MinMax result) {
-    char filename[64];
-    sprintf(filename, "%s%d%s", FILE_SYNC_BASE, index, FILE_SYNC_EXT);
-    FILE *file = fopen(filename, "w");
-    if (file) {
-        fprintf(file, "%d %d", result.min, result.max);
-        fclose(file);
-    } else {
-        perror("Error opening file for writing");
-    }
-}
-
-// Функция для чтения результата из файла
-int read_result_from_file(int index, struct MinMax *result) {
-    char filename[64];
-    sprintf(filename, "%s%d%s", FILE_SYNC_BASE, index, FILE_SYNC_EXT);
-    FILE *file = fopen(filename, "r");
-    if (file) {
-        if (fscanf(file, "%d %d", &result->min, &result->max) == 2) {
-            fclose(file);
-            // Удаляем файл после чтения
-            remove(filename); 
-            return 0; // Успех
-        }
-        fclose(file);
-        return -1; // Ошибка чтения
-    }
-    return -1; // Ошибка открытия
-}
-
-
-int main(int argc, char **argv) {
-    if (argc != 4) {
-        printf("Usage: %s seed arraysize sync_type\n", argv[0]);
-        printf("sync_type: pipe or by_files\n");
+int main(int argc, char *argv[]) {
+    if (argc != 5) {
+        printf("Usage: %s <array_size> <seed> <num_processes> <pipe|files>\n", argv[0]);
         return 1;
     }
-
-    int seed = atoi(argv[1]);
-    if (seed <= 0) {
-        printf("seed is a positive number\n");
+    
+    // Парсинг аргументов
+    unsigned int array_size = atoi(argv[1]);
+    unsigned int seed = atoi(argv[2]);
+    int num_processes = atoi(argv[3]);
+    int use_pipe = (strcmp(argv[4], "pipe") == 0);
+    
+    if (num_processes <= 0 || num_processes > MAX_PROCESSES) {
+        printf("Number of processes must be between 1 and %d\n", MAX_PROCESSES);
         return 1;
     }
-
-    int array_size = atoi(argv[2]);
-    if (array_size <= 0) {
-        printf("array_size is a positive number\n");
+    
+    // Выделение памяти для массива
+    int *array = (int*)malloc(sizeof(int) * array_size);
+    if (array == NULL) {
+        printf("Memory allocation failed\n");
         return 1;
     }
-
-    const char *sync_type = argv[3];
-    int use_files = (strcmp(sync_type, "by_files") == 0);
-
-    // Каналы для синхронизации (если не используем файлы)
-    int pipe_fds[2][2]; // pipe_fds[i][0] - чтение, pipe_fds[i][1] - запись для i-го процесса
-    if (!use_files) {
-        if (pipe(pipe_fds[0]) == -1 || pipe(pipe_fds[1]) == -1) {
-            perror("pipe failed");
-            return 1;
-        }
-    }
-
-    int *array = malloc(array_size * sizeof(int));
-    if (!array) {
-        perror("malloc failed");
-        return 1;
-    }
+    
+    // Генерация массива
     GenerateArray(array, array_size, seed);
-
-    unsigned int middle = array_size / 2;
-    pid_t pid1, pid2;
-    struct MinMax results[2];
-
-    // ----------------------------------------------------
-    // Создание и выполнение первого дочернего процесса
-    // ----------------------------------------------------
-    pid1 = fork();
-
-    if (pid1 < 0) {
-        perror("fork 1 failed");
-        free(array);
-        return 1;
-    } 
     
-    if (pid1 == 0) {
-        // Дочерний процесс 1
-        struct MinMax min_max = GetMinMax(array, 0, middle);
-        
-        if (!use_files) {
-            // Закрываем чтение, пишем в канал 1
-            close(pipe_fds[0][0]); 
-            write(pipe_fds[0][1], &min_max, sizeof(struct MinMax));
-            close(pipe_fds[0][1]);
-        } else {
-            write_result_to_file(0, min_max);
+    // Создание pipe'ов если используется pipe
+    int pipe_fds[MAX_PROCESSES][2];
+    if (use_pipe) {
+        for (int i = 0; i < num_processes; i++) {
+            if (pipe(pipe_fds[i]) == -1) {
+                perror("pipe");
+                free(array);
+                return 1;
+            }
         }
-        
-        free(array); // Освобождаем память в дочернем процессе
-        exit(0); // Завершаем дочерний процесс
     }
-
-    // ----------------------------------------------------
-    // Создание и выполнение второго дочернего процесса
-    // ----------------------------------------------------
-    pid2 = fork();
-
-    if (pid2 < 0) {
-        perror("fork 2 failed");
-        // Чистим ресурсы первого процесса (если он еще не завершился)
-        if (pid1 > 0) waitpid(pid1, NULL, 0); 
-        free(array);
-        return 1;
-    } 
     
-    if (pid2 == 0) {
-        // Дочерний процесс 2
-        struct MinMax min_max = GetMinMax(array, middle, array_size);
-
-        if (!use_files) {
-            // Закрываем чтение, пишем в канал 2
-            close(pipe_fds[1][0]); 
-            write(pipe_fds[1][1], &min_max, sizeof(struct MinMax));
-            close(pipe_fds[1][1]);
-        } else {
-            write_result_to_file(1, min_max);
-        }
-
-        free(array); // Освобождаем память в дочернем процессе
-        exit(0); // Завершаем дочерний процесс
-    }
-
-    // ----------------------------------------------------
-    // Родительский процесс: ожидание и сбор результатов
-    // ----------------------------------------------------
-
-    // Ожидание завершения дочерних процессов
-    waitpid(pid1, NULL, 0);
-    waitpid(pid2, NULL, 0);
-
-    // Сбор результатов
-    if (!use_files) {
-        // Сбор результатов через pipe
-        close(pipe_fds[0][1]); // Закрываем запись 1
-        read(pipe_fds[0][0], &results[0], sizeof(struct MinMax));
-        close(pipe_fds[0][0]); // Закрываем чтение 1
-
-        close(pipe_fds[1][1]); // Закрываем запись 2
-        read(pipe_fds[1][0], &results[1], sizeof(struct MinMax));
-        close(pipe_fds[1][0]); // Закрываем чтение 2
-
-    } else {
-        // Сбор результатов через файлы
-        if (read_result_from_file(0, &results[0]) != 0 || 
-            read_result_from_file(1, &results[1]) != 0) {
+    // Замер времени начала
+    struct timespec start_time, end_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    
+    // Создание дочерних процессов
+    for (int i = 0; i < num_processes; i++) {
+        pid_t pid = fork();
+        
+        if (pid == 0) {
+            // Дочерний процесс
+            if (use_pipe) {
+                close(pipe_fds[i][0]); // Закрываем чтение в дочернем процессе
+            }
             
-            fprintf(stderr, "Error reading results from files.\n");
+            // Вычисляем диапазон для текущего процесса
+            int chunk_size = array_size / num_processes;
+            int begin = i * chunk_size;
+            int end = (i == num_processes - 1) ? array_size : (i + 1) * chunk_size;
+            
+            // Находим min и max в своем диапазоне
+            struct MinMax local_min_max = GetMinMax(array, begin, end);
+            
+            if (use_pipe) {
+                // Передача через pipe
+                write(pipe_fds[i][1], &local_min_max, sizeof(struct MinMax));
+                close(pipe_fds[i][1]);
+            } else {
+                // Передача через файлы
+                char filename[50];
+                snprintf(filename, sizeof(filename), "min_max_%d.txt", i);
+                
+                FILE *file = fopen(filename, "w");
+                if (file) {
+                    fprintf(file, "%d %d", local_min_max.min, local_min_max.max);
+                    fclose(file);
+                }
+            }
+            
+            free(array);
+            exit(0);
+        } else if (pid < 0) {
+            printf("Fork failed\n");
             free(array);
             return 1;
         }
     }
     
-    // Определение общего минимума и максимума
-    struct MinMax final_min_max;
-    final_min_max.min = (results[0].min < results[1].min) ? results[0].min : results[1].min;
-    final_min_max.max = (results[0].max > results[1].max) ? results[0].max : results[1].max;
-
+    // Родительский процесс
+    if (use_pipe) {
+        for (int i = 0; i < num_processes; i++) {
+            close(pipe_fds[i][1]); // Закрываем запись в родительском процессе
+        }
+    }
+    
+    // Ожидание завершения всех дочерних процессов
+    for (int i = 0; i < num_processes; i++) {
+        wait(NULL);
+    }
+    
+    // Сбор результатов
+    struct MinMax partial_results[MAX_PROCESSES];
+    
+    if (use_pipe) {
+        // Чтение из pipe
+        for (int i = 0; i < num_processes; i++) {
+            read(pipe_fds[i][0], &partial_results[i], sizeof(struct MinMax));
+            close(pipe_fds[i][0]);
+        }
+    } else {
+        // Чтение из файлов
+        for (int i = 0; i < num_processes; i++) {
+            char filename[50];
+            snprintf(filename, sizeof(filename), "min_max_%d.txt", i);
+            
+            FILE *file = fopen(filename, "r");
+            if (file) {
+                fscanf(file, "%d %d", &partial_results[i].min, &partial_results[i].max);
+                fclose(file);
+                remove(filename); // Удаляем временный файл
+            }
+        }
+    }
+    
+    // Объединение результатов
+    struct MinMax final_result;
+    final_result.min = partial_results[0].min;
+    final_result.max = partial_results[0].max;
+    
+    for (int i = 1; i < num_processes; i++) {
+        if (partial_results[i].min < final_result.min) {
+            final_result.min = partial_results[i].min;
+        }
+        if (partial_results[i].max > final_result.max) {
+            final_result.max = partial_results[i].max;
+        }
+    }
+    
+    // Замер времени окончания
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    
+    // Вычисление времени выполнения
+    double execution_time = (end_time.tv_sec - start_time.tv_sec) + 
+                           (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+    
+    // Вывод результатов
+    printf("Min: %d\n", final_result.min);
+    printf("Max: %d\n", final_result.max);
+    printf("Execution time: %.6f seconds\n", execution_time);
+    
+    // Очистка
     free(array);
-
-    printf("min: %d\n", final_min_max.min);
-    printf("max: %d\n", final_min_max.max);
-
+    
     return 0;
 }
