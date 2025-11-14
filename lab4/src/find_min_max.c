@@ -1,7 +1,9 @@
 #include "find_min_max.h"
 #include <limits.h>
+#include <stddef.h> // Для size_t
 
-struct MinMax GetMinMax(int *array, unsigned int begin, unsigned int end) {
+// Индексы и цикл теперь используют size_t
+struct MinMax GetMinMax(int *array, size_t begin, size_t end) {
   struct MinMax min_max;
   min_max.min = INT_MAX;
   min_max.max = INT_MIN;
@@ -15,7 +17,7 @@ struct MinMax GetMinMax(int *array, unsigned int begin, unsigned int end) {
   min_max.max = array[begin];
 
 
-  for (unsigned int i = begin + 1; i < end; i++) {
+  for (size_t i = begin + 1; i < end; i++) {
     if (array[i] < min_max.min) {
       min_max.min = array[i];
     }

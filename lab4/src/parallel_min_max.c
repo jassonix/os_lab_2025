@@ -1,297 +1,230 @@
-#include <ctype.h>
 #include <limits.h>
-#include <stdbool.h>
+#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <errno.h>
-
-#include <sys/time.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <sys/stat.h>
-
-#include <getopt.h>
-
+#include <stdlib.h> 
+#include <string.h> 
+#include <stddef.h> 
 #include "find_min_max.h"
-#include "utils.h"
 
-// Используем -1 для обозначения "не завершен", 0 для "убит", 1 для "успешно завершен"
-#define PROCESS_STATUS_LIVE -1
-#define PROCESS_STATUS_KILLED 0
-#define PROCESS_STATUS_FINISHED 1
+// --- Прототипы функций для I/O ---
+int read_array_from_file(const char *filename, int **array, size_t *array_size_out);
+int write_result_to_file(const char *filename, struct MinMax result);
 
-static volatile sig_atomic_t timeout_occurred = 0;
+// --- Структура для передачи данных в поток ---
+struct ThreadData {
+  pthread_t thread;
+  int thread_id;
+  int *array;
+  size_t begin;
+  size_t end;
+  struct MinMax result;
+};
 
-void alarm_handler(int signum) {
-    (void)signum;
-    timeout_occurred = 1;
+// --- Функция-обработчик потока ---
+void *find_min_max_thread(void *arg) {
+  struct ThreadData *data = (struct ThreadData *)arg;
+  data->result = GetMinMax(data->array, data->begin, data->end);
+  return NULL;
 }
 
-int main(int argc, char **argv) {
-    int seed = -1;
-    int array_size = -1;
-    int pnum = -1;
-    bool with_files = false;
-    int timeout = 0;
+// --- ОСНОВНАЯ ФУНКЦИЯ main ---
+int main(int argc, char *argv[]) {
+  if (argc < 4) {
+    fprintf(stderr, "Использование:\n");
+    fprintf(stderr, "  Генерация/Pipe: %s pipe <seed> <размер_массива> <число_потоков>\n", argv[0]);
+    fprintf(stderr, "  Файловый ввод/вывод: %s files <входной_файл> <выходной_файл> <число_потоков>\n", argv[0]);
+    return 1;
+  }
 
-    // --- Обработка аргументов ---
-    while (1) {
-        static struct option options[] = {
-            {"seed", required_argument, 0, 0},
-            {"array_size", required_argument, 0, 0},
-            {"pnum", required_argument, 0, 0},
-            {"by_files", no_argument, 0, 'f'},
-            {"timeout", required_argument, 0, 0},
-            {0, 0, 0, 0}
-        };
+  char *mode = argv[1];
+  size_t array_size = 0;
+  int *array = NULL;
+  int num_threads = 0;
+  struct MinMax final_result;
+  int result_output_ok = 0; // Флаг успешного вывода результата
 
-        int option_index = 0;
-        int c = getopt_long(argc, argv, "f", options, &option_index);
+  // --- ЛОГИКА РЕЖИМА PIPE (Генерация данных) ---
+  if (strcmp(mode, "pipe") == 0) {
+    if (argc != 5) {
+      fprintf(stderr, "Ошибка: Для режима 'pipe' требуются <seed> <размер> <потоки>.\n");
+      return 1;
+    }
+    
+    // Парсинг аргументов с использованием strtoull для size_t
+    unsigned int seed = (unsigned int)strtoull(argv[2], NULL, 10);
+    array_size = strtoull(argv[3], NULL, 10);
+    num_threads = atoi(argv[4]);
 
-        if (c == -1) break;
-
-        switch (c) {
-            case 0:
-                if (strcmp(options[option_index].name, "seed") == 0) {
-                    seed = atoi(optarg);
-                    if (seed <= 0) { fprintf(stderr, "seed must be positive\n"); return 1; }
-                } else if (strcmp(options[option_index].name, "array_size") == 0) {
-                    array_size = atoi(optarg);
-                    if (array_size <= 0) { fprintf(stderr, "array_size must be positive\n"); return 1; }
-                } else if (strcmp(options[option_index].name, "pnum") == 0) {
-                    pnum = atoi(optarg);
-                    if (pnum <= 0) { fprintf(stderr, "pnum must be positive\n"); return 1; }
-                } else if (strcmp(options[option_index].name, "timeout") == 0) {
-                    timeout = atoi(optarg);
-                    if (timeout <= 0) { fprintf(stderr, "timeout must be positive\n"); return 1; }
-                }
-                break;
-            case 'f':
-                with_files = true;
-                break;
-            case '?':
-            default:
-                fprintf(stderr, "Invalid argument\n");
-                return 1;
-        }
+    if (array_size == 0 || num_threads <= 0) {
+      fprintf(stderr, "Ошибка: Размер и число потоков должны быть > 0.\n");
+      return 1;
     }
 
-    if (seed == -1 || array_size== -1 || pnum == -1) {
-        fprintf(stderr, "Usage: %s --seed <num> --array_size <num> --pnum <num> [--by_files] [--timeout <sec>]\n", argv[0]);
+    // Выделение памяти (Heap Allocation - ФИКС КРУПНЫХ МАССИВОВ)
+    printf("[PIPE MODE] Выделение памяти для %zu элементов...\n", array_size);
+    array = (int *)malloc(array_size * sizeof(int)); 
+    if (array == NULL) {
+      fprintf(stderr, "Ошибка: не удалось выделить %zu байт памяти (не хватает RAM?).\n", array_size * sizeof(int));
+      return 1;
+    }
+
+    // Заполнение массива (Генерация)
+    printf("[PIPE MODE] Заполнение массива...\n");
+    srand(seed);
+    for (size_t i = 0; i < array_size; i++) {
+      array[i] = rand(); 
+    }
+
+  } 
+  
+  // --- ЛОГИКА РЕЖИМА FILES (Чтение из файла) ---
+  else if (strcmp(mode, "files") == 0) {
+    if (argc != 5) {
+      fprintf(stderr, "Ошибка: Для режима 'files' требуются <входной_файл> <выходной_файл> <потоки>.\n");
+      return 1;
+    }
+
+    const char *input_filename = argv[2];
+    num_threads = atoi(argv[4]);
+
+    if (num_threads <= 0) {
+      fprintf(stderr, "Ошибка: Число потоков должно быть > 0.\n");
+      return 1;
+    }
+    
+    printf("[FILES MODE] Чтение данных из файла '%s'...\n", input_filename);
+    
+    if (read_array_from_file(input_filename, &array, &array_size) != 0) {
+        fprintf(stderr, "Ошибка: Не удалось прочитать массив из файла.\n");
         return 1;
     }
-    
-    // Ограничение pnum до array_size для логики деления массива
-    if (pnum > array_size) {
-        pnum = array_size;
-    }
-
-    // --- Инициализация данных ---
-    int *array = malloc(sizeof(int) * array_size);
-    if (!array) { perror("malloc array"); return 1; }
-    GenerateArray(array, array_size, seed);
-
-    pid_t *child_pids = malloc(sizeof(pid_t) * pnum);
-    int *process_status = malloc(sizeof(int) * pnum); // Для отслеживания успешного завершения
-    if (!child_pids || !process_status) { perror("malloc pids/status"); free(array); free(child_pids); free(process_status); return 1; }
-    for(int i = 0; i < pnum; i++) process_status[i] = PROCESS_STATUS_LIVE;
-
-    int *pipe_fds = NULL;
-    if (!with_files) {
-        pipe_fds = malloc(2 * pnum * sizeof(int));
-        if (!pipe_fds) { perror("malloc pipe_fds"); free(array); free(child_pids); free(process_status); return 1; }
-        for (int i = 0; i < pnum; i++) {
-            if (pipe(pipe_fds + 2 * i) < 0) {
-                perror("pipe");
-                // Очистка и выход
-                free(array); free(child_pids); free(process_status); free(pipe_fds); 
-                return 1;
-            }
-        }
-    }
-
-    struct timeval start_time;
-    gettimeofday(&start_time, NULL);
-
-    int part_size = array_size / pnum;
-    int remainder = array_size % pnum;
-    // --- Запуск дочерних процессов ---
-    int active_child_processes = 0;
-    for (int i = 0; i < pnum; i++) {
-        int current_part_size = part_size + (i < remainder ? 1 : 0);
-        int start_index = i * part_size + (i < remainder ? i : remainder);
-        int end_index = start_index + current_part_size;
-
-        if (current_part_size == 0) continue; // Пропускаем, если pnum > array_size
-
-        pid_t pid = fork();
-        if (pid < 0) {
-            perror("fork");
-            for (int j = 0; j < active_child_processes; j++) {
-                kill(child_pids[j], SIGTERM);
-            }
-            free(array); free(child_pids); free(process_status); if (!with_files) free(pipe_fds);
-            return 1;
-        }
-
-        if (pid == 0) {
-            // Child
-            struct MinMax mm = GetMinMax(array, start_index, end_index);
-            
-            if (!with_files) {
-                for (int j = 0; j < pnum; j++) {
-                    if (j != i) {
-                        close(pipe_fds[2 * j]); // Закрыть все неиспользуемые read ends
-                        close(pipe_fds[2 * j + 1]); // Закрыть все неиспользуемые write ends
-                    }
-                }
-                close(pipe_fds[2 * i]); // Закрыть read end родителя
-                // Пишем результат
-                if (write(pipe_fds[2 * i + 1], &mm.min, sizeof(int)) != sizeof(int) ||
-                    write(pipe_fds[2 * i + 1], &mm.max, sizeof(int)) != sizeof(int)) {
-                    perror("write");
-                    exit(1); // Выход с ошибкой
-                }
-                close(pipe_fds[2 * i + 1]); // Закрыть write end
-            } else {
-                char fname[256];
-                snprintf(fname, sizeof(fname), "minmax_%d.txt", (int)getpid());
-                FILE *f = fopen(fname, "w");
-                if (f) {
-                    fprintf(f, "%d %d", mm.min, mm.max);
-                    fclose(f);
-                } else {
-                    perror("fopen");
-                    exit(1);
-                }
-            }
-
-            free(array); free(child_pids); free(process_status); if (!with_files) free(pipe_fds);
-            exit(0);
-        }
-
-        // Parent
-        child_pids[i] = pid;
-        active_child_processes++;
-        if (!with_files) {
-            close(pipe_fds[2 * i + 1]); // Закрыть пишущий конец пайпа в родителе
-        }
-    }
-    
-    // --- Ожидание и таймаут ---
-    if (timeout > 0) {
-        signal(SIGALRM, alarm_handler);
-        alarm(timeout);
-    }
-
-    while (active_child_processes > 0) {
-        if (timeout > 0 && timeout_occurred) {
-            // Таймаут сработал - Убить всех активных детей
-            for (int i = 0; i < pnum; i++) {
-                if (process_status[i] == PROCESS_STATUS_LIVE) {
-                    kill(child_pids[i], SIGKILL);
-                    process_status[i] = PROCESS_STATUS_KILLED;
-                    active_child_processes--; // уменьшаем счетчик сразу после kill
-                }
-            }
-            break; // Выход из основного цикла ожидания
-        }
-
-        int status;
-        pid_t finished = waitpid(-1, &status, WNOHANG);
-
-        if (finished > 0) {
-            // active_child_processes--; // Уменьшаем только в случае успешного завершения
-            for (int i = 0; i < pnum; i++) {
-                if (child_pids[i] == finished) {
-                    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                        process_status[i] = PROCESS_STATUS_FINISHED;
-                        active_child_processes--;
-                    } else if (process_status[i] == PROCESS_STATUS_LIVE) {
-                        // Ребенок завершился с ошибкой или сигналом, но не был помечен как убитый
-                        process_status[i] = PROCESS_STATUS_KILLED; // Считаем его 'убитым' для пропуска сбора
-                        active_child_processes--;
-                    }
-                    break;
-                }
-            }
-        } else if (finished == 0) {
-            usleep(1000); // 1 ms
-        } else {
-            if (errno != ECHILD) {
-                perror("waitpid");
-            }
-            break; 
-        }
-    }
-    
-    // Очистка таймаута
-    if (timeout > 0) {
-        alarm(0); // Отменяем таймер, если он еще активен
-        signal(SIGALRM, SIG_DFL); // Возвращаем стандартную обработку
-    }
-
-    // --- Сбор результатов ---
-    struct MinMax global = { .min = INT_MAX, .max = INT_MIN };
-    bool has_result = false;
-
-    for (int i = 0; i < pnum; i++) {
-        if (process_status[i] == PROCESS_STATUS_FINISHED) {
-            int min = INT_MAX, max = INT_MIN;
-
-            if (with_files) {
-                char fname[256];
-                snprintf(fname, sizeof(fname), "minmax_%d.txt", (int)child_pids[i]);
-                FILE *f = fopen(fname, "r");
-                if (f) {
-                    if (fscanf(f, "%d %d", &min, &max) == 2) {
-                        has_result = true;
-                    }
-                    fclose(f);
-                    unlink(fname);
-                }
-            } else {
-                ssize_t min_read = read(pipe_fds[2 * i], &min, sizeof(int));
-                ssize_t max_read = read(pipe_fds[2 * i], &max, sizeof(int));
-                
-                if (min_read == sizeof(int) && max_read == sizeof(int)) {
-                    has_result = true;
-                }
-                close(pipe_fds[2 * i]); // Закрыть читающий конец пайпа
-            }
-
-            if (has_result) {
-                if (min < global.min) global.min = min;
-                if (max > global.max) global.max = max;
-            }
-        } else if (!with_files) {
-            // Если процесс был убит или не завершился успешно, закрываем читающий конец пайпа, 
-            // если он не был закрыт ранее (он закрывается только в цикле сбора)
-             close(pipe_fds[2 * i]);
-        }
-    }
-
-    // --- Очистка и вывод ---
+  } 
+  
+  // --- НЕИЗВЕСТНЫЙ РЕЖИМ ---
+  else {
+    fprintf(stderr, "Ошибка: Неизвестный режим работы '%s'. Используйте 'pipe' или 'files'.\n", mode);
+    return 1;
+  }
+  
+  // --- ОБЩАЯ МНОГОПОТОЧНАЯ ЛОГИКА ---
+  
+  if (array == NULL || array_size == 0) {
+      fprintf(stderr, "Ошибка: Массив пуст.\n");
+      return 1;
+  }
+  
+  // 4. ЗАПУСК ПОТОКОВ
+  struct ThreadData *thread_data = malloc(num_threads * sizeof(struct ThreadData));
+  if (thread_data == NULL) {
+    fprintf(stderr, "Ошибка: не удалось выделить память для данных потоков.\n");
     free(array);
-    free(child_pids);
-    free(process_status);
-    if (!with_files) {
-        free(pipe_fds);
+    return 1;
+  }
+  
+  size_t chunk_size = array_size / num_threads;
+  final_result.min = INT_MAX;
+  final_result.max = INT_MIN;
+
+  printf("Запуск %d потоков (общий размер: %zu)...\n", num_threads, array_size);
+
+  for (int i = 0; i < num_threads; i++) {
+    thread_data[i].thread_id = i;
+    thread_data[i].array = array;
+    thread_data[i].begin = i * chunk_size;
+    // Обеспечиваем, что последний поток обработает все оставшиеся элементы
+    thread_data[i].end = (i == num_threads - 1) ? array_size : (i + 1) * chunk_size;
+
+    if (pthread_create(&thread_data[i].thread, NULL, find_min_max_thread, &thread_data[i]) != 0) {
+      perror("pthread_create");
+      free(array); free(thread_data); return 1;
+    }
+  }
+
+  // 5. ОЖИДАНИЕ И ОБЪЕДИНЕНИЕ РЕЗУЛЬТАТОВ
+  for (int i = 0; i < num_threads; i++) {
+    pthread_join(thread_data[i].thread, NULL);
+    
+    if (thread_data[i].result.min < final_result.min) final_result.min = thread_data[i].result.min;
+    if (thread_data[i].result.max > final_result.max) final_result.max = thread_data[i].result.max;
+  }
+  
+
+  // 6. ВЫВОД РЕЗУЛЬТАТА
+  if (strcmp(mode, "pipe") == 0) {
+    // Вывод в stdout для режима pipe
+    printf("--- Результат (pipe) --- \n");
+    printf("Глобальный минимум: %d\n", final_result.min);
+    printf("Глобальный максимум: %d\n", final_result.max);
+    printf("------------------------\n");
+    result_output_ok = 0;
+  } else {
+    // Вывод в файл для режима files
+    const char *output_filename = argv[3];
+    printf("[FILES MODE] Запись результата в файл '%s'...\n", output_filename);
+    result_output_ok = write_result_to_file(output_filename, final_result);
+  }
+
+
+  // 7. ОЧИСТКА
+  free(array);
+  free(thread_data);
+
+  return (result_output_ok != 0) ? 1 : 0;
+}
+
+
+// --- РЕАЛИЗАЦИЯ ФУНКЦИЙ ФАЙЛОВОГО I/O ---
+
+// Читает массив из файла. Предполагается, что файл содержит только int в бинарном формате.
+int read_array_from_file(const char *filename, int **array, size_t *array_size_out) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) {
+        perror("Error opening input file for reading");
+        return -1;
+    }
+    
+    // Определяем размер файла
+    fseek(f, 0, SEEK_END);
+    long file_size = ftell(f);
+    if (file_size < 0) {
+        perror("Error determining file size");
+        fclose(f);
+        return -1;
     }
 
-    struct timeval end_time;
-    gettimeofday(&end_time, NULL);
-    double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
-                        (end_time.tv_usec - start_time.tv_usec) / 1000.0;
+    *array_size_out = file_size / sizeof(int);
+    fseek(f, 0, SEEK_SET);
+    
+    // Выделяем память
+    *array = (int*)malloc(*array_size_out * sizeof(int));
+    if (*array == NULL) {
+        fprintf(stderr, "Error: Could not allocate memory for array from file.\n");
+        fclose(f);
+        return -1;
+    }
+    
+    // Читаем весь массив
+    size_t items_read = fread(*array, sizeof(int), *array_size_out, f);
+    if (items_read != *array_size_out) {
+        fprintf(stderr, "Warning: Expected %zu items, read %zu items.\n", *array_size_out, items_read);
+    }
 
-    printf("Min: %d\n", global.min);
-    printf("Max: %d\n", global.max);
-    printf("Elapsed time: %fms\n", elapsed_ms);
-    fflush(stdout);
+    fclose(f);
+    printf("Прочитано %zu элементов.\n", *array_size_out);
+    return 0;
+}
 
+// Записывает результат в файл (текстовый формат).
+int write_result_to_file(const char *filename, struct MinMax result) {
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        perror("Error opening output file for writing");
+        return -1;
+    }
+    
+    fprintf(f, "Min: %d\n", result.min);
+    fprintf(f, "Max: %d\n", result.max);
+    
+    fclose(f);
     return 0;
 }
