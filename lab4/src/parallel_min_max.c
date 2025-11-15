@@ -55,13 +55,6 @@ int main(int argc, char *argv[]) {
     array_size = strtoull(argv[3], NULL, 10);
     num_threads = atoi(argv[4]);
 
-    // ПРОВЕРКА ОГРАНИЧЕНИЯ НА 800 МИЛЛИОНОВ ЭЛЕМЕНТОВ
-    if (array_size > 800000000) {
-      fprintf(stderr, "Ошибка: Превышено максимальное количество элементов (800,000,000).\n");
-      fprintf(stderr, "Получено: %zu элементов.\n", array_size);
-      return 1;
-    }
-
     if (array_size == 0 || num_threads <= 0) {
       fprintf(stderr, "Ошибка: Размер и число потоков должны быть > 0.\n");
       return 1;
